@@ -3,62 +3,85 @@ import fetch from "node-fetch";
 import cors from "cors";
 
 const app = express();
-app.use(cors({ origin: "*" }));
+const PORT = process.env.PORT || 3000;
 
+// Lấy key và kiểm tra
 const API_KEYS = [
   process.env.PEXELS_API_KEY_1,
   process.env.PEXELS_API_KEY_2,
   process.env.PEXELS_API_KEY_3
 ].filter(Boolean);
 
-// Hàm lấy ảnh đơn lẻ
+// Cảnh báo nếu chưa nhập biến môi trường trên Dashboard Render
+if (API_KEYS.length === 0) {
+  console.error("❌ ERROR: No PEXELS_API_KEYS found in Environment Variables!");
+}
+
+let preferredKeyIndex = 0;
+
+app.use(cors({ origin: "*" }));
+
+// Hàm gọi ảnh đơn lẻ
 async function fetchImageWithKey(keyword, key) {
   try {
     const resp = await fetch(
-      `https://api.pexels.com/v1/search?query=${encodeURIComponent(keyword)}&per_page=1`,
-      { headers: { Authorization: key }, timeout: 5000 }
+      `https://api.pexels.com/v1/search?query=${encodeURIComponent(keyword)}&per_page=3`,
+      { 
+        headers: { Authorization: key },
+        signal: AbortSignal.timeout(5000) // Tự ngắt sau 5s nếu Pexels quá chậm
+      }
     );
+    
+    if (resp.status === 429) {
+      console.warn(`⚠️ Key ${key.substring(0, 5)}... bị giới hạn (Rate Limit)`);
+      return null;
+    }
+
     if (!resp.ok) return null;
+
     const data = await resp.json();
-    return data.photos?.[0]?.src?.medium || null;
+    const photo = data.photos?.find(p => p?.src?.medium);
+    return photo?.src?.medium || null;
   } catch (err) {
+    console.warn(`⚠️ Lỗi khi gọi Pexels: ${err.message}`);
     return null;
   }
 }
 
-// Endpoint Batch đã được tối ưu tốc độ để tránh bị Pexels chặn
+// Logic thông minh thử lần lượt các key
+async function fetchImageSmart(keyword) {
+  for (let i = 0; i < API_KEYS.length; i++) {
+    const index = (preferredKeyIndex + i) % API_KEYS.length;
+    const key = API_KEYS[index];
+    const url = await fetchImageWithKey(keyword, key);
+    if (url) {
+      preferredKeyIndex = index;
+      return url;
+    }
+  }
+  return null;
+}
+
+// Endpoint Batch - Đã tối ưu để không bị Pexels đánh dấu Spam
 app.get("/api/pexels/batch", async (req, res) => {
   const raw = (req.query.keywords || "").trim();
   if (!raw) return res.status(400).json({ error: "Missing keywords" });
 
   const list = [...new Set(raw.split(",").map(k => k.trim().toLowerCase()).filter(Boolean))];
-  const images = {};
+  const results = {};
 
-  // Chọn ngẫu nhiên key bắt đầu để phân phối tải đều hơn giữa 3 key
-  let keyIndex = Math.floor(Math.random() * API_KEYS.length);
-
-  // Dùng vòng lặp thường thay vì Promise.all để tránh bị đánh dấu Spam
-  for (const kw of list) {
-    let found = false;
-    // Thử các key hiện có
-    for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
-      const currentKey = API_KEYS[(keyIndex + attempt) % API_KEYS.length];
-      const url = await fetchImageWithKey(kw, currentKey);
-      
-      if (url) {
-        images[kw] = url;
-        keyIndex = (keyIndex + attempt) % API_KEYS.length; // Giữ key đang chạy tốt
-        found = true;
-        break; 
-      }
-    }
-    if (!found) images[kw] = null;
-    
-    // Nghỉ 100ms giữa mỗi lần gọi để "qua mắt" bộ lọc của Pexels
-    await new Promise(resolve => setTimeout(resolve, 100));
+  // Không dùng Promise.all để tránh bắn 50 requests cùng lúc
+  for (const k of list) {
+    results[k] = await fetchImageSmart(k);
+    // Nghỉ nhẹ 50ms giữa các từ khóa để an toàn cho Key
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
 
-  res.json({ images });
+  res.json({ images: results });
 });
 
-export default app; // Quan trọng để chạy trên Vercel
+// Quan trọng: Phải lắng nghe trên 0.0.0.0 để Render nhận diện được service
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Pexels Proxy online: http://0.0.0.0:${PORT}`);
+  console.log(`🔑 Đang sử dụng ${API_KEYS.length} API Keys`);
+});
